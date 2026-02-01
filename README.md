@@ -230,9 +230,17 @@ curl -fsSL https://raw.githubusercontent.com/Azure/AKSFlexNode/main/scripts/unin
 - The Azure Arc agent remains installed but can be removed manually if not needed
 - Backup any important data before uninstalling
 
-## Building from Source
+## Contributing
 
-For developers who want to build from source:
+Interested in contributing to AKS Flex Node? See [CONTRIBUTING.md](CONTRIBUTING.md) for:
+
+- Development setup and building from source
+- Running unit tests and E2E tests
+- Setting up E2E testing infrastructure
+- Code quality checks and linting
+- Pull request process
+
+Quick start for contributors:
 
 ```bash
 # Build the application
@@ -240,9 +248,10 @@ make build
 
 # Run tests
 make test
-```
 
-For a complete list of build targets, run `make help`.
+# Run all quality checks
+make check
+```
 
 ## System Requirements
 
@@ -267,8 +276,9 @@ For a complete list of build targets, run `make help`.
 
 ## Documentation
 
-### Architecture & Design
+### For Users
 
+- **[README.md](README.md)** - Getting started, installation, and usage (this document)
 - **[Architecture Documentation](ARCHITECTURE.md)** - Comprehensive system architecture
   - High-level architecture diagrams and component interactions
   - Azure API reference with complete specifications
@@ -276,21 +286,20 @@ For a complete list of build targets, run `make help`.
   - Detailed bootstrap process (11 steps)
   - Network requirements and data flow
 
-### Additional Documentation [TO BE ADDED]
+### For Contributors
 
-- [Development Guide](docs/DEVELOPMENT.md) - Build, test, and contribute
-- [Configuration Reference](docs/CONFIGURATION.md) - Complete config options
-- [Setup Guide](docs/AKS_EDGE_NODE_SETUP_GUIDE.md) - Step-by-step deployment
-- [Troubleshooting](docs/TROUBLESHOOTING.md) - Common issues and solutions
-- [APT Packaging](docs/APT_PACKAGING_GUIDE.md) - Package management
+- **[CONTRIBUTING.md](CONTRIBUTING.md)** - Development guide
+  - Building from source and development setup
+  - Running tests (unit tests and E2E tests)
+  - Setting up E2E testing infrastructure
+  - Code quality checks and linting
+  - Pull request process
 
-## Contributing
+### Advanced Topics
 
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+- [AKS Cluster Setup](docs/AKS_CLUSTER_SETUP.md) - Detailed AKS cluster creation
+- [E2E CI/CD Guide](docs/E2E_CICD_GUIDE.md) - Complete E2E pipeline documentation
+- [GitHub Azure Auth Guide](docs/GITHUB_AZURE_AUTH_GUIDE.md) - Authentication deep dive
 
 ## License
 

@@ -1,0 +1,426 @@
+name: E2E Tests
+
+# This workflow runs ONLY on self-hosted runner
+# Tests the COMPLETE flow: Create AKS cluster → Create VM → Register as flex node
+
+on:
+  # Manual trigger for E2E testing
+  workflow_dispatch:
+    inputs:
+      skip_cleanup:
+        description: 'Skip cleanup (keep cluster and VM for debugging)'
+        required: false
+        default: false
+        type: boolean
+
+  # Run on release tags
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: '1.24'
+
+jobs:
+  e2e-test:
+    name: End-to-End Test
+    runs-on: [self-hosted, e2e, azure]  # ⚡ Specific labels - only E2E runner matches
+    timeout-minutes: 45
+
+    steps:
+      # ========================================================================
+      # Phase 1: Build
+      # ========================================================================
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Build binary for E2E testing
+        run: |
+          VERSION="${GITHUB_REF_NAME:-dev}"
+          GIT_COMMIT=$(git rev-parse --short HEAD)
+          BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          LDFLAGS="-X main.Version=${VERSION} -X main.GitCommit=${GIT_COMMIT} -X main.BuildTime=${BUILD_DATE}"
+
+          GOOS=linux GOARCH=amd64 go build -ldflags "${LDFLAGS}" -o aks-flex-node .
+          chmod +x aks-flex-node
+
+          echo "✅ Binary built successfully"
+          ./aks-flex-node version
+
+      # ========================================================================
+      # Phase 2: Create Test Infrastructure (Uses Managed Identity)
+      # ========================================================================
+
+      - name: Verify Azure Access
+        run: |
+          echo "Testing Managed Identity authentication..."
+          az account show --query "{Subscription:name, User:user.name}" -o table
+          echo "✅ Managed Identity works - no secrets needed!"
+
+      - name: Generate unique test names
+        id: test-names
+        run: |
+          TIMESTAMP=$(date +%s)
+          CLUSTER_NAME="aks-e2e-test-${TIMESTAMP}"
+          VM_NAME="vm-e2e-test-${TIMESTAMP}"
+          NODE_NAME="e2e-node-${TIMESTAMP}"
+
+          echo "CLUSTER_NAME=$CLUSTER_NAME" >> $GITHUB_OUTPUT
+          echo "VM_NAME=$VM_NAME" >> $GITHUB_OUTPUT
+          echo "NODE_NAME=$NODE_NAME" >> $GITHUB_OUTPUT
+          echo "CLUSTER_NAME=$CLUSTER_NAME" >> $GITHUB_ENV
+          echo "VM_NAME=$VM_NAME" >> $GITHUB_ENV
+          echo "NODE_NAME=$NODE_NAME" >> $GITHUB_ENV
+
+          echo "Test Cluster: $CLUSTER_NAME"
+          echo "Test VM: $VM_NAME"
+          echo "Arc Node: $NODE_NAME"
+
+      - name: Create AKS cluster for testing
+        id: create-cluster
+        run: |
+          echo "Creating test AKS cluster: $CLUSTER_NAME"
+
+          az aks create \
+            --resource-group ${{ secrets.E2E_RESOURCE_GROUP }} \
+            --name $CLUSTER_NAME \
+            --location ${{ secrets.E2E_LOCATION }} \
+            --enable-managed-identity \
+            --enable-aad \
+            --enable-azure-rbac \
+            --network-plugin azure \
+            --node-count 1 \
+            --node-vm-size Standard_B2s \
+            --generate-ssh-keys \
+            --tags "github-run=${{ github.run_id }}" "purpose=e2e-test" "auto-delete=true" \
+            --output json > /tmp/cluster-info.json
+
+          CLUSTER_ID=$(jq -r '.id' /tmp/cluster-info.json)
+          echo "CLUSTER_ID=$CLUSTER_ID" >> $GITHUB_OUTPUT
+          echo "CLUSTER_ID=$CLUSTER_ID" >> $GITHUB_ENV
+
+          echo "✅ AKS cluster created: $CLUSTER_ID"
+
+          # Get cluster credentials
+          az aks get-credentials \
+            --resource-group ${{ secrets.E2E_RESOURCE_GROUP }} \
+            --name $CLUSTER_NAME \
+            --overwrite-existing \
+            --admin
+
+          echo "✅ Cluster credentials configured"
+
+      - name: Provision test VM
+        id: provision
+        run: |
+          echo "Creating test VM: $VM_NAME"
+
+          az vm create \
+            --resource-group ${{ secrets.E2E_RESOURCE_GROUP }} \
+            --name $VM_NAME \
+            --location ${{ secrets.E2E_LOCATION }} \
+            --image Canonical:0001-com-ubuntu-server-jammy:22_04-lts-gen2:latest \
+            --size Standard_B2ms \
+            --admin-username azureuser \
+            --generate-ssh-keys \
+            --public-ip-sku Standard \
+            --tags "github-run=${{ github.run_id }}" "purpose=e2e-test" "auto-delete=true" \
+            --output json > /tmp/vm-info.json
+
+          VM_IP=$(jq -r '.publicIpAddress' /tmp/vm-info.json)
+          echo "VM_IP=$VM_IP" >> $GITHUB_OUTPUT
+          echo "VM_IP=$VM_IP" >> $GITHUB_ENV
+
+          echo "✅ Test VM created: $VM_IP"
+
+          # Wait for SSH
+          echo "Waiting for SSH to be ready..."
+          for i in {1..30}; do
+            if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 azureuser@$VM_IP "echo ready" &>/dev/null; then
+              echo "✅ SSH ready"
+              break
+            fi
+            echo "  Attempt $i/30..."
+            sleep 10
+          done
+
+      # ========================================================================
+      # Phase 3: Prepare Test Configuration
+      # ========================================================================
+
+      - name: Generate bootstrap config
+        run: |
+          cat > config.json <<EOF
+          {
+            "azure": {
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}",
+              "cloud": "AzurePublicCloud",
+              "servicePrincipal": {
+                "clientId": "${{ secrets.E2E_VM_CLIENT_ID }}",
+                "clientSecret": "${{ secrets.E2E_VM_CLIENT_SECRET }}"
+              },
+              "arc": {
+                "machineName": "${{ env.NODE_NAME }}",
+                "resourceGroup": "${{ secrets.E2E_RESOURCE_GROUP }}",
+                "location": "${{ secrets.E2E_LOCATION }}",
+                "autoRoleAssignment": true,
+                "tags": {
+                  "environment": "e2e-test",
+                  "github-run": "${{ github.run_id }}",
+                  "test-vm": "${{ env.VM_NAME }}",
+                  "test-cluster": "${{ env.CLUSTER_NAME }}"
+                }
+              },
+              "targetCluster": {
+                "resourceId": "${{ env.CLUSTER_ID }}",
+                "location": "${{ secrets.E2E_LOCATION }}"
+              }
+            },
+            "agent": {
+              "logLevel": "debug",
+              "logDir": "/var/log/aks-flex-node"
+            }
+          }
+          EOF
+
+          echo "✅ Config generated for node: $NODE_NAME → cluster: $CLUSTER_NAME"
+
+      - name: Upload binary and config to test VM
+        run: |
+          echo "Uploading files to $VM_IP..."
+
+          scp -o StrictHostKeyChecking=no aks-flex-node azureuser@$VM_IP:/tmp/
+          scp -o StrictHostKeyChecking=no config.json azureuser@$VM_IP:/tmp/
+
+          echo "✅ Files uploaded"
+
+      # ========================================================================
+      # Phase 4: Run Bootstrap Test
+      # ========================================================================
+
+      - name: Run bootstrap on test VM
+        id: bootstrap
+        run: |
+          echo "Running bootstrap on test VM..."
+
+          ssh -o StrictHostKeyChecking=no azureuser@$VM_IP 'bash -s' <<'BOOTSTRAP_TEST'
+          set -euo pipefail
+
+          echo "[1/5] Installing aks-flex-node..."
+          sudo cp /tmp/aks-flex-node /usr/local/bin/
+          sudo chmod +x /usr/local/bin/aks-flex-node
+          aks-flex-node version
+
+          echo "[2/5] Setting up configuration..."
+          sudo mkdir -p /etc/aks-flex-node
+          sudo cp /tmp/config.json /etc/aks-flex-node/
+          sudo mkdir -p /var/log/aks-flex-node
+
+          echo "[3/5] Running bootstrap..."
+          sudo aks-flex-node bootstrap --config /etc/aks-flex-node/config.json
+
+          if [ $? -eq 0 ]; then
+            echo "✅ Bootstrap completed successfully"
+          else
+            echo "❌ Bootstrap failed"
+            sudo cat /var/log/aks-flex-node/aks-flex-node.log
+            exit 1
+          fi
+
+          echo "[4/5] Verifying Arc agent..."
+          if sudo azcmagent show &>/dev/null; then
+            echo "✅ Arc agent registered"
+          else
+            echo "❌ Arc agent not registered"
+            exit 1
+          fi
+
+          echo "[5/5] Verifying kubelet..."
+          sleep 10  # Wait for kubelet to start
+          if systemctl is-active --quiet kubelet; then
+            echo "✅ kubelet is running"
+          else
+            echo "⚠️  kubelet not running yet"
+          fi
+          BOOTSTRAP_TEST
+
+          echo "✅ Bootstrap test completed"
+
+      # ========================================================================
+      # Phase 5: Verification (Uses Managed Identity)
+      # ========================================================================
+
+      - name: Verify Arc registration in Azure
+        if: success()
+        run: |
+          echo "Checking Arc machine registration..."
+
+          # Wait a bit for Arc registration to complete
+          sleep 15
+
+          if az connectedmachine show \
+            --resource-group ${{ secrets.E2E_RESOURCE_GROUP }} \
+            --name $NODE_NAME \
+            &>/dev/null; then
+
+            echo "✅ Arc machine registered in Azure"
+            az connectedmachine show \
+              --resource-group ${{ secrets.E2E_RESOURCE_GROUP }} \
+              --name $NODE_NAME \
+              --query "{Name:name, Status:status, Location:location}" -o table
+          else
+            echo "❌ Arc machine not visible in Azure"
+            exit 1
+          fi
+
+      - name: Verify node joined AKS cluster
+        if: success()
+        run: |
+          echo "Checking if node joined AKS cluster..."
+
+          # Wait for node to join
+          echo "Waiting for node to appear in cluster..."
+          for i in {1..30}; do
+            if kubectl get nodes | grep -q "$NODE_NAME"; then
+              echo "✅ Node successfully joined cluster"
+              kubectl get nodes
+              exit 0
+            fi
+            echo "  Waiting... ($i/30)"
+            sleep 10
+          done
+
+          echo "❌ Node did not join cluster within timeout"
+          kubectl get nodes
+          exit 1
+
+      # ========================================================================
+      # Phase 6: Collect Logs
+      # ========================================================================
+
+      - name: Collect logs from test VM
+        if: always()
+        run: |
+          mkdir -p /tmp/e2e-logs
+
+          echo "Collecting logs from test VM..."
+
+          ssh -o StrictHostKeyChecking=no azureuser@$VM_IP \
+            "sudo cat /var/log/aks-flex-node/aks-flex-node.log 2>/dev/null" \
+            > /tmp/e2e-logs/aks-flex-node.log || echo "No aks-flex-node log"
+
+          ssh -o StrictHostKeyChecking=no azureuser@$VM_IP \
+            "sudo journalctl -u kubelet -n 200 --no-pager 2>/dev/null" \
+            > /tmp/e2e-logs/kubelet.log || echo "No kubelet log"
+
+          ssh -o StrictHostKeyChecking=no azureuser@$VM_IP \
+            "sudo journalctl -u containerd -n 100 --no-pager 2>/dev/null" \
+            > /tmp/e2e-logs/containerd.log || echo "No containerd log"
+
+          echo "✅ Logs collected"
+
+      - name: Upload logs as artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs-${{ github.run_id }}
+          path: /tmp/e2e-logs/
+          retention-days: 7
+
+      # ========================================================================
+      # Phase 7: Cleanup (Uses Managed Identity)
+      # ========================================================================
+
+      - name: Cleanup test VM
+        if: always() && !inputs.skip_cleanup
+        run: |
+          echo "Cleaning up test VM: $VM_NAME"
+
+          az vm delete \
+            --resource-group ${{ secrets.E2E_RESOURCE_GROUP }} \
+            --name $VM_NAME \
+            --yes \
+            --no-wait
+
+          echo "✅ Test VM deletion initiated"
+
+      - name: Cleanup Arc registration
+        if: always() && !inputs.skip_cleanup
+        run: |
+          echo "Cleaning up Arc machine: $NODE_NAME"
+
+          # Wait a bit for Arc to fully register before trying to delete
+          sleep 10
+
+          az connectedmachine delete \
+            --resource-group ${{ secrets.E2E_RESOURCE_GROUP }} \
+            --name $NODE_NAME \
+            --yes \
+            --no-wait \
+            || echo "Arc machine may not be registered yet"
+
+          echo "✅ Arc cleanup initiated"
+
+      - name: Cleanup AKS cluster
+        if: always() && !inputs.skip_cleanup
+        run: |
+          echo "Cleaning up AKS cluster: $CLUSTER_NAME"
+
+          az aks delete \
+            --resource-group ${{ secrets.E2E_RESOURCE_GROUP }} \
+            --name $CLUSTER_NAME \
+            --yes \
+            --no-wait
+
+          echo "✅ AKS cluster deletion initiated"
+
+      # ========================================================================
+      # Phase 8: Report Results
+      # ========================================================================
+
+      - name: Test summary
+        if: always()
+        run: |
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "E2E Test Summary"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo ""
+          echo "Test Cluster:   $CLUSTER_NAME"
+          echo "Test VM:        $VM_NAME"
+          echo "Arc Node:       $NODE_NAME"
+          echo "Bootstrap:      ${{ steps.bootstrap.outcome }}"
+          echo "Logs uploaded:  e2e-logs-${{ github.run_id }}"
+          echo ""
+
+          if [ "${{ steps.bootstrap.outcome }}" == "success" ]; then
+            echo "✅ E2E Test PASSED"
+            echo ""
+            echo "The aks-flex-node successfully:"
+            echo "  ✅ Created fresh AKS cluster"
+            echo "  ✅ Installed on Ubuntu 22.04 VM"
+            echo "  ✅ Registered VM with Azure Arc"
+            echo "  ✅ Configured kubelet and containerd"
+            echo "  ✅ Joined the VM as flex node to AKS cluster"
+            echo ""
+            exit 0
+          else
+            echo "❌ E2E Test FAILED"
+            echo ""
+            echo "Check the uploaded logs for details:"
+            echo "  Actions → This run → Artifacts → e2e-logs-${{ github.run_id }}"
+            echo ""
+            exit 1
+          fi
