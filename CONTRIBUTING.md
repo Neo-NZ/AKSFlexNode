@@ -538,9 +538,6 @@ If coverage drops below 30%:
 
 - **Architecture:** [ARCHITECTURE.md](ARCHITECTURE.md) - System architecture and design
 - **Development Guide:** [CLAUDE.md](CLAUDE.md) - Guide for Claude Code development
-- **AKS Cluster Setup:** [docs/AKS_CLUSTER_SETUP.md](docs/AKS_CLUSTER_SETUP.md) - Detailed AKS setup
-- **E2E CI/CD Guide:** [docs/E2E_CICD_GUIDE.md](docs/E2E_CICD_GUIDE.md) - Complete E2E pipeline docs
-- **Auth Guide:** [docs/GITHUB_AZURE_AUTH_GUIDE.md](docs/GITHUB_AZURE_AUTH_GUIDE.md) - Authentication deep dive
 
 ---
 
